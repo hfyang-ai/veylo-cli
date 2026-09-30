@@ -10,4 +10,4 @@ build/
 .ruff_cache/
 .idea/
 .veylo/
-
+.vscode/
