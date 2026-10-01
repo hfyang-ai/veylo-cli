@@ -79,7 +79,7 @@ src/veylo/
 ├── mcp/           MCP Client、Server 与动态工具注册
 ├── runtime/       Thread/Turn API 和持久化任务队列
 ├── render/        Rich/纯文本终端渲染
-├── snapshot/      执行前后快照与恢复
+├── snapshot/      执行前增量快照与恢复
 ├── checkpoint/    执行进度检查点与断点续跑（/resume）
 ├── rag/           本地代码索引与搜索
 ├── web/           网页搜索和抓取工具

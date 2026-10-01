@@ -195,13 +195,16 @@ class Agent:
             {"type": "done", "total_turns": int, "total_tokens": int,
              "usage": {...}, "cost": {...}, "messages": [Message, ...]}
         """
-        snapshot = SnapshotService(self.cwd)
-        with suppress(Exception):
-            snapshot.create("pre-turn")
         self._run_message = message
-        # Plan/team runners mint their own run id and checkpoint internally.
+        # Plan/team runners mint their own run id, checkpoint, and snapshot
+        # internally; only the react path snapshots at this layer. A pre-turn
+        # snapshot is enough — the post-turn copy is redundant because the next
+        # run's pre-turn captures the same state.
         if self.mode not in {"plan", "team"} and not self.run_id:
             self.run_id = new_run_id("react")
+            snapshot = SnapshotService(self.cwd)
+            with suppress(Exception):
+                snapshot.create("pre-turn")
 
         try:
             if self.mode == "plan":
@@ -217,9 +220,6 @@ class Agent:
             with suppress(Exception):
                 self._save_checkpoint("interrupted")
             raise
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
 
     async def run_complete(self, message: str) -> QueryResult:
         """Run the agent synchronously (collect all events) and return a result."""

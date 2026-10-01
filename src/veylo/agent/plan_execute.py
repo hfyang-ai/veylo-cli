@@ -135,9 +135,6 @@ class PlanExecuteAgent:
             self._save_checkpoint(status="interrupted", plan=plan, error=str(exc))
             yield {"type": "error", "error": exc}
             return
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
         yield self._done_event(final_text)
 
     async def resume(self, record: CheckpointRecord) -> AsyncIterator[dict[str, Any]]:
@@ -186,9 +183,6 @@ class PlanExecuteAgent:
             self._save_checkpoint(status="interrupted", plan=plan, error=str(exc))
             yield {"type": "error", "error": exc}
             return
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-resume")
         yield self._done_event(final_text)
 
     def _done_event(self, final_text: str) -> dict[str, Any]:

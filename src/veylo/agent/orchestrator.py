@@ -404,9 +404,6 @@ class AgentOrchestrator:
             self._save_checkpoint(status="interrupted", steps=steps, error=str(exc))
             yield {"type": "error", "error": exc}
             return
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
         done: dict[str, Any] = {
             "type": "done",
             "total_turns": self.total_turns,
@@ -459,9 +456,6 @@ class AgentOrchestrator:
             self._save_checkpoint(status="interrupted", steps=steps, error=str(exc))
             yield {"type": "error", "error": exc}
             return
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-resume")
         done: dict[str, Any] = {
             "type": "done",
             "total_turns": self.total_turns,
