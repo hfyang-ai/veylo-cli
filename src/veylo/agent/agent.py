@@ -118,6 +118,7 @@ class Agent:
         error: str = "",
         messages: list[Message] | None = None,
         usage: Usage | None = None,
+        turns: int = 0,
     ) -> None:
         """Persist ReAct conversation state; never let storage failure break a run.
 
@@ -135,9 +136,9 @@ class Agent:
             status=status,
             state={"messages": _messages_to_dicts(history)},
             usage=(usage if usage is not None else self.last_usage).to_dict(),
-            turns=0,
+            turns=turns,
             error=error,
-            progress={"turns": len(history)},
+            progress={"completed": turns},
         )
         with suppress(Exception):
             self.checkpoint_store.save(record)
@@ -367,7 +368,7 @@ class Agent:
             messages.append(assistant_msg)
             yield {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason}
             # Land progress each turn so an interruption keeps the conversation.
-            self._save_checkpoint("running", messages=messages, usage=total_usage)
+            self._save_checkpoint("running", messages=messages, usage=total_usage, turns=turn)
 
             # If the model didn't request any tools, we're done.
             if stop_reason != "tool_use" and not tool_calls:
@@ -421,7 +422,7 @@ class Agent:
         # Persist history for next user message and report final usage.
         self.history = list(messages)
         self.last_usage = total_usage
-        self._save_checkpoint("completed", messages=messages, usage=total_usage)
+        self._save_checkpoint("completed", messages=messages, usage=total_usage, turns=turn)
 
         done_event: dict[str, Any] = {
             "type": "done",

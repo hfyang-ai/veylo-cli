@@ -367,15 +367,19 @@ async def _resume_command(
         table.add_column("#")
         table.add_column("run id")
         table.add_column("mode")
-        table.add_column("进度")
+        table.add_column("已完成轮数" if records[0].mode == "react" else "进度")
         table.add_column("更新时间")
         for index, record in enumerate(records[:20], start=1):
-            progress = record.progress or {}
+            progress = (
+                f"{record.progress.get('completed', 0)}"
+                if record.mode == "react"
+                else f"{record.progress.get('completed', 0)}/{record.progress.get('total', 0)}"
+            )
             table.add_row(
                 str(index),
                 record.run_id,
                 record.mode,
-                f"{progress.get('completed', 0)}/{progress.get('total', 0)}",
+                progress,
                 record.updated_at[:19],
             )
         console.print(table)
