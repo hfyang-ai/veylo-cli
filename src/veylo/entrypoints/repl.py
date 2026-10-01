@@ -20,6 +20,7 @@ from rich.table import Table
 from veylo import __version__
 from veylo.agent import Agent, AgentOrchestrator, PlanExecuteAgent
 from veylo.bootstrap import build_tool_registry
+from veylo.checkpoint import CheckpointRecord, CheckpointStore
 from veylo.config import VeyloConfig, config_to_public_dict
 from veylo.entrypoints.model_selector import ModelSelectorState, run_model_selector
 from veylo.llm import create_llm_client
@@ -62,6 +63,7 @@ SLASH_COMMANDS = [
     "/task",
     "/snapshot",
     "/restore",
+    "/resume",
 ]
 
 
@@ -73,6 +75,7 @@ class PermissionModeController:
     """Apply one of the two interactive permission modes to the live config."""
 
     config: VeyloConfig
+    # "auto" disables HITL and both guards, so the safe default is "default".
     mode: PermissionMode = "default"
 
     def __post_init__(self) -> None:
@@ -338,9 +341,98 @@ async def _handle_slash(
         else:
             record = SnapshotService(cwd).restore(arg)
             console.print(f"Restored {record.id}")
+    elif command == "/resume":
+        await _resume_command(arg, console, cwd, config, agent, registry)
     else:
         console.print(f"[red]Unknown command:[/red] {command}")
     return False
+
+
+async def _resume_command(
+    arg: str,
+    console: Console,
+    cwd: str,
+    config: VeyloConfig,
+    agent: Agent,
+    registry: ToolRegistry,
+) -> None:
+    """List or continue interrupted runs from their last checkpoint."""
+    store = CheckpointStore(cwd)
+    records = store.resumable(limit=10_000)
+    if not arg:
+        if not records:
+            console.print("[dim]没有可恢复的检查点。[/dim]")
+            return
+        table = Table(title="可恢复的检查点")
+        table.add_column("#")
+        table.add_column("run id")
+        table.add_column("mode")
+        table.add_column("进度")
+        table.add_column("更新时间")
+        for index, record in enumerate(records[:20], start=1):
+            progress = record.progress or {}
+            table.add_row(
+                str(index),
+                record.run_id,
+                record.mode,
+                f"{progress.get('completed', 0)}/{progress.get('total', 0)}",
+                record.updated_at[:19],
+            )
+        console.print(table)
+        console.print("[dim]/resume <编号> 或 /resume <run-id> 继续；/resume clean 清空。[/dim]")
+        return
+
+    if arg == "clean":
+        console.print(f"已清除 {store.clean()} 个检查点")
+        return
+
+    record: CheckpointRecord | None = None
+    if arg.isdigit():
+        index = int(arg) - 1
+        if 0 <= index < len(records):
+            record = records[index]
+    else:
+        record = next((item for item in records if item.run_id == arg), None)
+    if record is None:
+        console.print(f"[red]没有找到可恢复的检查点：{arg}[/red]")
+        return
+
+    if record.mode == "plan":
+        runner: PlanExecuteAgent | AgentOrchestrator = PlanExecuteAgent(
+            llm_client=agent.llm_client,
+            tool_registry=registry,
+            config=config,
+            cwd=cwd,
+            approval_callback=agent.approval_callback,
+            checkpoint_store=store,
+        )
+    elif record.mode == "team":
+        runner = AgentOrchestrator(
+            llm_client=agent.llm_client,
+            tool_registry=registry,
+            config=config,
+            cwd=cwd,
+            approval_callback=agent.approval_callback,
+            checkpoint_store=store,
+        )
+    elif record.mode == "react":
+        # A react checkpoint carries conversation history, so restore it onto
+        # the live agent instead of building a new runner.
+        await _run_events(
+            agent.resume(record),
+            RichRenderer(),
+            agent.llm_client.max_context_window,
+        )
+        return
+    else:
+        console.print(f"[red]暂不支持恢复 mode={record.mode} 的检查点[/red]")
+        return
+
+    await _run_events(
+        runner.resume(record),
+        RichRenderer(),
+        agent.llm_client.max_context_window,
+    )
 
 
 async def _memory_command(arg: str, console: Console, cwd: str, config: VeyloConfig) -> None:

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from veylo.agent.query import query
+from veylo.checkpoint import CheckpointRecord, CheckpointStore, new_run_id
 from veylo.config import VeyloConfig
 from veylo.llm.base import LlmClient
 from veylo.plan import ExecutionPlan, Planner, Task, TaskStatus
@@ -41,6 +42,7 @@ class PlanExecuteAgent:
         approval_callback=None,
         planner: Planner | None = None,
         max_task_turns: int = 8,
+        checkpoint_store: CheckpointStore | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -50,33 +52,76 @@ class PlanExecuteAgent:
         self.planner = planner or Planner(llm_client)
         self.max_task_turns = max_task_turns
         self.history: list[Message] = []
+        self._checkpoint_store = checkpoint_store
+        self.run_id: str | None = None
+        self._run_message = ""
+        self._total_usage = Usage()
+        self._total_turns = 0
+
+    @property
+    def checkpoint_store(self) -> CheckpointStore:
+        if self._checkpoint_store is None:
+            self._checkpoint_store = CheckpointStore(self.cwd)
+        return self._checkpoint_store
+
+    def _save_checkpoint(
+        self,
+        *,
+        status: str,
+        plan: ExecutionPlan | None = None,
+        error: str = "",
+    ) -> None:
+        """Persist run progress; never let a storage failure break the run."""
+        if not self.run_id:
+            return
+        record = CheckpointRecord(
+            run_id=self.run_id,
+            mode="plan",
+            message=self._run_message,
+            cwd=self.cwd,
+            status=status,
+            state={"plan": plan.to_dict()} if plan is not None else {},
+            usage=self._total_usage.to_dict(),
+            turns=self._total_turns,
+            error=error,
+            progress=_plan_progress(plan) if plan is not None else {},
+        )
+        with suppress(Exception):
+            self.checkpoint_store.save(record)
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
-        total_usage = Usage()
-        total_turns = 0
+        self._total_usage = Usage()
+        self._total_turns = 0
+        self._run_message = message
+        self.run_id = new_run_id("plan")
         final_text = ""
+        plan: ExecutionPlan | None = None
         try:
             yield {"type": "text_delta", "text": f"正在规划任务：{message}\n\n"}
             yield {"type": "plan_status", "phase": "planning"}
-            plan: ExecutionPlan | None = None
             async for event in self.planner.stream_plan(message):
                 if event.get("type") == "plan_created":
                     plan = event["plan"]
                     continue
                 if event.get("type") == "usage":
-                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
+                    self._total_usage = self._total_usage + Usage.from_mapping(
+                        event.get("usage") or {}
+                    )
                 yield event
             if plan is None:
                 raise ValueError("planner did not produce an execution plan")
+            self._save_checkpoint(status="running", plan=plan)
             yield {"type": "text_delta", "text": plan.summarize() + "\n\n"}
             async for event in self._execute_plan(plan):
                 if event.get("type") == "usage":
-                    total_usage = total_usage + Usage.from_mapping(event.get("usage") or {})
+                    self._total_usage = self._total_usage + Usage.from_mapping(
+                        event.get("usage") or {}
+                    )
                 elif event.get("type") == "plan_task_done":
-                    total_turns += int(event.get("turns") or 0)
+                    self._total_turns += int(event.get("turns") or 0)
                     continue
                 elif event.get("type") == "text_delta":
                     final_text += str(event.get("text") or "")
@@ -85,23 +130,79 @@ class PlanExecuteAgent:
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
             ]
+            self._save_checkpoint(status="completed", plan=plan)
         except Exception as exc:  # noqa: BLE001
+            self._save_checkpoint(status="interrupted", plan=plan, error=str(exc))
             yield {"type": "error", "error": exc}
             return
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
+        yield self._done_event(final_text)
+
+    async def resume(self, record: CheckpointRecord) -> AsyncIterator[dict[str, Any]]:
+        """Continue an interrupted plan run from its last checkpoint."""
+        plan_data = record.state.get("plan")
+        if not plan_data:
+            yield {"type": "error", "error": ValueError("checkpoint 不包含计划状态")}
+            return
+        plan = ExecutionPlan.from_dict(plan_data)
+        reset = _reset_inflight_tasks(plan)
+        progress = _plan_progress(plan)
+        snapshot = SnapshotService(self.cwd)
+        with suppress(Exception):
+            snapshot.create("pre-resume")
+        self.run_id = record.run_id
+        self._run_message = record.message
+        self._total_usage = Usage.from_mapping(record.usage or {})
+        self._total_turns = record.turns
+        final_text = ""
+        try:
+            yield {
+                "type": "text_delta",
+                "text": (
+                    f"从检查点恢复：{record.run_id}\n"
+                    f"已完成 {progress['completed']}/{progress['total']}，"
+                    f"重置 {reset} 个中断任务。\n\n"
+                ),
+            }
+            async for event in self._execute_plan(plan):
+                if event.get("type") == "usage":
+                    self._total_usage = self._total_usage + Usage.from_mapping(
+                        event.get("usage") or {}
+                    )
+                elif event.get("type") == "plan_task_done":
+                    self._total_turns += int(event.get("turns") or 0)
+                    continue
+                elif event.get("type") == "text_delta":
+                    final_text += str(event.get("text") or "")
+                yield event
+            self.history = [
+                Message(role="user", content=record.message),
+                Message(role="assistant", content=final_text),
+            ]
+            self._save_checkpoint(status="completed", plan=plan)
+        except Exception as exc:  # noqa: BLE001
+            self._save_checkpoint(status="interrupted", plan=plan, error=str(exc))
+            yield {"type": "error", "error": exc}
+            return
+        finally:
+            with suppress(Exception):
+                snapshot.create("post-resume")
+        yield self._done_event(final_text)
+
+    def _done_event(self, final_text: str) -> dict[str, Any]:
         done: dict[str, Any] = {
             "type": "done",
-            "total_turns": total_turns,
-            "total_tokens": total_usage.total_tokens,
-            "usage": total_usage.to_dict(),
+            "total_turns": self._total_turns,
+            "total_tokens": self._total_usage.total_tokens,
+            "usage": self._total_usage.to_dict(),
             "messages": self.history,
         }
-        costs = _calculate_costs(self.llm_client, total_usage)
+        costs = _calculate_costs(self.llm_client, self._total_usage)
         if costs:
             done["cost"] = costs
-        yield done
+        return done
 
     async def _execute_plan(self, plan: ExecutionPlan) -> AsyncIterator[dict[str, Any]]:
         yield {"type": "text_delta", "text": "开始执行计划……\n\n"}
@@ -120,7 +221,7 @@ class PlanExecuteAgent:
                         yield event
                 if result is None:
                     raise RuntimeError(f"task {executable[0].id} did not produce a result")
-                async for event in self._apply_task_result(result):
+                async for event in self._apply_task_result(result, plan):
                     yield event
                 continue
             yield {
@@ -162,7 +263,7 @@ class PlanExecuteAgent:
                         turns=0,
                         error=RuntimeError(f"task {task.id} did not produce a result"),
                     )
-                async for event in self._apply_task_result(result):
+                async for event in self._apply_task_result(result, plan):
                     yield event
 
         if plan.has_failed():
@@ -178,21 +279,29 @@ class PlanExecuteAgent:
                 "text": "计划已停滞，因为任务依赖未满足。\n\n",
             }
 
-    async def _apply_task_result(self, result: TaskRunResult) -> AsyncIterator[dict[str, Any]]:
+    async def _apply_task_result(
+        self,
+        result: TaskRunResult,
+        plan: ExecutionPlan | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         if result.error:
             result.task.mark_failed(str(result.error))
             yield {"type": "text_delta", "text": f"失败 [{result.task.id}]：{result.error}\n\n"}
-            return
-        result.task.mark_completed(result.text)
-        yield {
-            "type": "text_delta",
-            "text": f"已完成 [{result.task.id}]：{_preview(result.text)}\n\n",
-        }
-        yield {
-            "type": "usage",
-            "usage": result.usage.to_dict(),
-        }
-        yield {"type": "plan_task_done", "turns": result.turns, "tokens": result.tokens}
+        else:
+            result.task.mark_completed(result.text)
+            yield {
+                "type": "text_delta",
+                "text": f"已完成 [{result.task.id}]：{_preview(result.text)}\n\n",
+            }
+            yield {
+                "type": "usage",
+                "usage": result.usage.to_dict(),
+            }
+            yield {"type": "plan_task_done", "turns": result.turns, "tokens": result.tokens}
+        if plan is not None:
+            # Land progress after every task so an interruption only loses the
+            # task in flight, not the whole plan.
+            self._save_checkpoint(status="running", plan=plan)
 
     async def _pump_task_events(
         self,
@@ -285,6 +394,31 @@ class PlanExecuteAgent:
             + "请具体完成任务，并在需要时使用工具。"
             + _task_language_instruction(plan.goal)
         )
+
+
+def _plan_progress(plan: ExecutionPlan) -> dict[str, int]:
+    return {
+        "total": len(plan.tasks),
+        "completed": sum(
+            1 for task in plan.tasks.values() if task.status == TaskStatus.COMPLETED
+        ),
+        "failed": sum(1 for task in plan.tasks.values() if task.status == TaskStatus.FAILED),
+    }
+
+
+def _reset_inflight_tasks(plan: ExecutionPlan) -> int:
+    """Re-queue tasks that were mid-flight when the run stopped.
+
+    A checkpoint written between "task started" and "task finished" leaves the
+    task RUNNING; nothing is driving it any more, so it must go back to PENDING.
+    """
+    reset = 0
+    for task in plan.all_tasks():
+        if task.status == TaskStatus.RUNNING:
+            task.status = TaskStatus.PENDING
+            task.start_time = 0.0
+            reset += 1
+    return reset
 
 
 def _with_task_context(event: dict[str, Any], task: Task) -> dict[str, Any]:

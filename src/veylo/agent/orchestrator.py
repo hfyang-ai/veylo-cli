@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Any
 
 from veylo.agent.query import query
+from veylo.checkpoint import CheckpointRecord, CheckpointStore, new_run_id
 from veylo.config import VeyloConfig
 from veylo.llm.base import LlmClient
 from veylo.prompt import PromptAssembler
@@ -100,6 +101,30 @@ class ExecutionStep:
 
     def started(self) -> ExecutionStep:
         return replace(self, status=StepStatus.RUNNING)
+
+    def to_dict(self) -> dict:
+        """Serialize for checkpointing."""
+        return {
+            "id": self.id,
+            "description": self.description,
+            "type": self.type,
+            "dependencies": list(self.dependencies),
+            "mode": self.mode,
+            "result": self.result,
+            "status": str(self.status),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ExecutionStep:
+        return cls(
+            id=data["id"],
+            description=data.get("description", ""),
+            type=data.get("type", "ANALYSIS"),
+            dependencies=list(data.get("dependencies", [])),
+            mode=data.get("mode", AgentRunMode.REACT.value),
+            result=data.get("result", ""),
+            status=StepStatus(data.get("status", StepStatus.PENDING.value)),
+        )
 
 
 class SubAgent:
@@ -286,6 +311,7 @@ class AgentOrchestrator:
         approval_callback=None,
         worker_count: int = 2,
         default_worker_mode: str = AgentRunMode.REACT.value,
+        checkpoint_store: CheckpointStore | None = None,
     ):
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -302,6 +328,40 @@ class AgentOrchestrator:
         self.history: list[Message] = []
         self.total_usage = Usage()
         self.total_turns = 0
+        self._checkpoint_store = checkpoint_store
+        self.run_id: str | None = None
+        self._run_message = ""
+
+    @property
+    def checkpoint_store(self) -> CheckpointStore:
+        if self._checkpoint_store is None:
+            self._checkpoint_store = CheckpointStore(self.cwd)
+        return self._checkpoint_store
+
+    def _save_checkpoint(
+        self,
+        *,
+        status: str,
+        steps: list[ExecutionStep] | None = None,
+        error: str = "",
+    ) -> None:
+        """Persist step progress; never let a storage failure break the run."""
+        if not self.run_id:
+            return
+        record = CheckpointRecord(
+            run_id=self.run_id,
+            mode="team",
+            message=self._run_message,
+            cwd=self.cwd,
+            status=status,
+            state={"steps": [step.to_dict() for step in steps]} if steps else {},
+            usage=self.total_usage.to_dict(),
+            turns=self.total_turns,
+            error=error,
+            progress=_steps_progress(steps or []),
+        )
+        with suppress(Exception):
+            self.checkpoint_store.save(record)
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)
@@ -310,6 +370,9 @@ class AgentOrchestrator:
         final_text = ""
         self.total_usage = Usage()
         self.total_turns = 0
+        self._run_message = message
+        self.run_id = new_run_id("team")
+        steps: list[ExecutionStep] = []
         try:
             yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
             plan_result = await self.planner.execute(
@@ -323,6 +386,7 @@ class AgentOrchestrator:
             steps = self.parse_plan(plan_result.content)
             if not steps:
                 raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
+            self._save_checkpoint(status="running", steps=steps)
             yield {"type": "text_delta", "text": self.summarize_steps(steps) + "\n"}
             yield {"type": "text_delta", "text": "Phase 2: workers and reviewer\n\n"}
             for event in await self._execute_steps(
@@ -335,12 +399,69 @@ class AgentOrchestrator:
                 Message(role="user", content=message),
                 Message(role="assistant", content=final_text),
             ]
+            self._save_checkpoint(status="completed", steps=steps)
         except Exception as exc:  # noqa: BLE001
+            self._save_checkpoint(status="interrupted", steps=steps, error=str(exc))
             yield {"type": "error", "error": exc}
             return
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
+        done: dict[str, Any] = {
+            "type": "done",
+            "total_turns": self.total_turns,
+            "total_tokens": self.total_usage.total_tokens,
+            "usage": self.total_usage.to_dict(),
+            "messages": self.history,
+        }
+        costs = _calculate_costs(self.llm_client, self.total_usage)
+        if costs:
+            done["cost"] = costs
+        yield done
+
+    async def resume(self, record: CheckpointRecord) -> AsyncIterator[dict[str, Any]]:
+        """Continue an interrupted multi-agent run from its last checkpoint."""
+        raw_steps = record.state.get("steps")
+        if not raw_steps:
+            yield {"type": "error", "error": ValueError("checkpoint 不包含步骤状态")}
+            return
+        steps = [ExecutionStep.from_dict(item) for item in raw_steps]
+        reset = _reset_inflight_steps(steps)
+        progress = _steps_progress(steps)
+        snapshot = SnapshotService(self.cwd)
+        with suppress(Exception):
+            snapshot.create("pre-resume")
+        self.run_id = record.run_id
+        self._run_message = record.message
+        self.total_usage = Usage.from_mapping(record.usage or {})
+        self.total_turns = record.turns
+        try:
+            yield {
+                "type": "text_delta",
+                "text": (
+                    f"从检查点恢复：{record.run_id}\n"
+                    f"已完成 {progress['completed']}/{progress['total']}，"
+                    f"重置 {reset} 个中断步骤。\n\n"
+                ),
+            }
+            for event in await self._execute_steps(
+                steps, lambda text: {"type": "text_delta", "text": text}
+            ):
+                yield event
+            final_text = self.build_final_result(steps)
+            yield {"type": "text_delta", "text": final_text}
+            self.history = [
+                Message(role="user", content=record.message),
+                Message(role="assistant", content=final_text),
+            ]
+            self._save_checkpoint(status="completed", steps=steps)
+        except Exception as exc:  # noqa: BLE001
+            self._save_checkpoint(status="interrupted", steps=steps, error=str(exc))
+            yield {"type": "error", "error": exc}
+            return
+        finally:
+            with suppress(Exception):
+                snapshot.create("post-resume")
         done: dict[str, Any] = {
             "type": "done",
             "total_turns": self.total_turns,
@@ -602,7 +723,10 @@ class AgentOrchestrator:
         for index, step in enumerate(steps):
             if step.id == step_id:
                 steps[index] = updated
-                return
+                break
+        # Land progress on every step transition (start / complete / fail) so an
+        # interruption only loses the step in flight.
+        self._save_checkpoint(status="running", steps=steps)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:
@@ -613,6 +737,29 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("JSON root must be an object")
     return data
+
+
+def _steps_progress(steps: list[ExecutionStep]) -> dict[str, int]:
+    return {
+        "total": len(steps),
+        "completed": sum(1 for step in steps if step.status == StepStatus.COMPLETED),
+        "failed": sum(1 for step in steps if step.status == StepStatus.FAILED),
+    }
+
+
+def _reset_inflight_steps(steps: list[ExecutionStep]) -> int:
+    """Re-queue steps left RUNNING by an interrupted run.
+
+    A checkpoint written between "step started" and "step finished" leaves the
+    step RUNNING, but nothing is driving it any more, so it must go back to
+    PENDING to be picked up again.
+    """
+    reset = 0
+    for step in steps:
+        if step.status == StepStatus.RUNNING:
+            step.status = StepStatus.PENDING
+            reset += 1
+    return reset
 
 
 def _preview(text: str, max_len: int = 160) -> str:

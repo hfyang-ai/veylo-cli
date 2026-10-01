@@ -77,6 +77,36 @@ class Task:
             for dep_id in self.dependencies
         )
 
+    def to_dict(self) -> dict:
+        """Serialize for checkpointing."""
+        return {
+            "id": self.id,
+            "description": self.description,
+            "type": str(self.type),
+            "dependencies": list(self.dependencies),
+            "dependents": list(self.dependents),
+            "status": str(self.status),
+            "result": self.result,
+            "error": self.error,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Task:
+        return cls(
+            id=data["id"],
+            description=data.get("description", ""),
+            type=TaskType(data.get("type", TaskType.ANALYSIS.value)),
+            dependencies=list(data.get("dependencies", [])),
+            dependents=list(data.get("dependents", [])),
+            status=TaskStatus(data.get("status", TaskStatus.PENDING.value)),
+            result=data.get("result", ""),
+            error=data.get("error", ""),
+            start_time=float(data.get("start_time", 0.0)),
+            end_time=float(data.get("end_time", 0.0)),
+        )
+
 
 @dataclass(slots=True)
 class ExecutionPlan:
@@ -185,6 +215,35 @@ class ExecutionPlan:
     def mark_failed(self) -> None:
         self.status = PlanStatus.FAILED
         self.end_time = time.time()
+
+    def to_dict(self) -> dict:
+        """Serialize for checkpointing (tasks, status and execution order)."""
+        return {
+            "id": self.id,
+            "goal": self.goal,
+            "status": str(self.status),
+            "summary": self.summary,
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "execution_order": self.execution_order(),
+            "tasks": {task_id: task.to_dict() for task_id, task in self.tasks.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ExecutionPlan:
+        plan = cls(
+            id=data["id"],
+            goal=data.get("goal", ""),
+            status=PlanStatus(data.get("status", PlanStatus.CREATED.value)),
+            summary=data.get("summary", ""),
+            start_time=float(data.get("start_time", 0.0)),
+            end_time=float(data.get("end_time", 0.0)),
+        )
+        for task_id, raw in (data.get("tasks") or {}).items():
+            plan.tasks[task_id] = Task.from_dict(raw)
+        order = list(data.get("execution_order") or [])
+        plan._execution_order = [task_id for task_id in order if task_id in plan.tasks]
+        return plan
 
     def summarize(self) -> str:
         batches = self.execution_batches()

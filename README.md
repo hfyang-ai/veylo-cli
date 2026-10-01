@@ -124,51 +124,55 @@ uv run veylo -p "解释这个仓库"
 进入 `uv run veylo` 后，可以使用这些 slash commands：
 
 ```text
-/help
-/exit
-/clear
-/context
-/memory
-/memory search <query>
-/memory stats
-/memory delete <id>
-/memory clear
-/save <fact>
-/config
-/tools
-/hitl default|auto
-/policy
-/audit [N]
-/index [path]
-/search <query>
-/plan <task>
-/team <task>
-/team --plan <task>
-/model
-/model <model-id>
-/model <provider> <model-id>
-/usage
-/skill
-/skill list
-/skill show <name>
-/skill on <name>
-/skill off <name>
-/skill reload
-/mcp
-/task
-/task add [--mode react|plan|team] <task>
-/task cancel <task_id>
-/task log <task_id>
-/snapshot
-/snapshot clean
-/restore <snapshot-id-or-index>
+/help                                # 显示帮助信息
+/exit                                # 退出程序
+/clear                               # 清除当前对话历史
+/context                             # 查看当前上下文使用情况
+/memory                              # 列出最近记忆
+/memory search <query>               # 搜索记忆
+/memory stats                        # 记忆统计
+/memory delete <id>                  # 删除指定记忆
+/memory clear                        # 清空所有记忆
+/save <fact>                         # 快速保存一条记忆
+/config                              # 查看当前配置
+/tools                               # 列出所有可用工具
+/hitl default|auto                   # 切换 HITL 审批模式
+/policy                              # 查看安全策略
+/audit [N]                           # 查看最近 N 条审计日志
+/index [path]                        # 索引代码库以支持语义搜索
+/search <query>                      # 语义搜索代码库
+/plan <task>                         # 以 Plan-and-Execute 模式执行任务
+/team <task>                         # 以 Team 多 Agent 模式执行任务
+/team --plan <task>                  # 以 Team + Plan 模式执行任务
+/model                               # 打开交互式模型选择器
+/model <model-id>                    # 直接切换到指定模型
+/model <provider> <model-id>         # 切换模型提供商和模型
+/usage                               # 查看本次会话 token 用量
+/skill                               # 列出所有技能
+/skill list                          # 列出所有技能
+/skill show <name>                   # 查看技能详情
+/skill on <name>                     # 启用指定技能
+/skill off <name>                    # 禁用指定技能
+/skill reload                        # 重新加载所有技能
+/mcp                                 # 管理 MCP 连接
+/task                                # 列出异步任务
+/task add [--mode react|plan|team] <task>  # 提交异步任务
+/task cancel <task_id>               # 取消异步任务
+/task log <task_id>                  # 查看任务日志
+/snapshot                            # 列出文件快照
+/snapshot clean                      # 清理所有快照
+/restore <snapshot-id-or-index>      # 恢复工作区到指定快照
+/resume                              # 列出可恢复的检查点
+/resume <编号|run-id>                 # 从检查点恢复中断的 Agent 运行
+/resume clean                        # 清理所有检查点
 ```
+
+选中旧内容，粘贴新内容即可。后续工具恢复后我可以帮你做这类修改。
 
 `/model` 会打开交互式模型选择器：`Tab` 或左右方向键在 `Default`、`Custom`
 之间切换，上下方向键选择模型，`Enter` 立即切换当前 Agent。`Custom` 中可以选择已保存的
 BYOK 模型、创建新的 DeepSeek/GLM/OpenAI-compatible 配置，或按 `d` 删除配置。自定义配置
-保存在权限为 `0600` 的 `~/.veylo/models.json`；建议填写 API Key 环境变量名，只有显式输入
-API Key 时才会把密钥写入该文件。
+保存在权限为 `0600` 的 `~/.veylo/models.json`；建议填写 API Key 环境变量名，只有显式输入API Key 时才会把密钥写入该文件。
 
 ## 内置工具
 
@@ -388,6 +392,26 @@ REPL 中可以使用：
 /restore 1
 /snapshot clean
 ```
+
+## 检查点与断点续跑
+
+快照负责「文件回滚」，检查点负责「执行进度」。Plan-and-Execute 和 Multi-Agent 这类多步骤
+任务中断（Ctrl+C、网络超时、崩溃）后，不必从头重跑：
+
+- 每个任务/步骤状态变更时落盘一次，只丢「进行中」的那一步
+- 检查点保存在 `~/.veylo/checkpoints/`，按项目隔离
+- 恢复时把中断时处于 `RUNNING` 的任务/步骤重置为 `PENDING`，已完成的结果保留
+
+REPL 中可以使用：
+
+```text
+/resume            # 列出可恢复的运行
+/resume 1          # 按编号恢复
+/resume clean      # 清空检查点
+```
+
+ReAct 模式的检查点记录会话历史，恢复后带着上下文继续对话（不会自动重跑原请求，避免重复
+消耗 token）。
 
 ## SDK
 

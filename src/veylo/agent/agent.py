@@ -20,6 +20,7 @@ from typing import Any, Literal
 
 from veylo.agent.orchestrator import AgentOrchestrator
 from veylo.agent.plan_execute import PlanExecuteAgent
+from veylo.checkpoint import CheckpointRecord, CheckpointStore, new_run_id
 from veylo.config import VeyloConfig
 from veylo.context import ContextBudget, ContextWindowManager
 from veylo.image import parse_image_references
@@ -68,6 +69,7 @@ class Agent:
         system_prompt: str | None = None,
         max_turns: int = 20,
         max_plan_depth: int = 1,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -77,6 +79,9 @@ class Agent:
         self.mode = mode
         self.max_turns = max_turns
         self.max_plan_depth = max_plan_depth
+        self._checkpoint_store = checkpoint_store
+        self.run_id: str | None = None
+        self._run_message = ""
 
         # Build the base system prompt from personality profile and config.
         self.system_prompt = (
@@ -100,6 +105,64 @@ class Agent:
 
         # Validate configuration.
         self._validate_config()
+
+    @property
+    def checkpoint_store(self) -> CheckpointStore:
+        if self._checkpoint_store is None:
+            self._checkpoint_store = CheckpointStore(self.cwd)
+        return self._checkpoint_store
+
+    def _save_checkpoint(
+        self,
+        status: str,
+        error: str = "",
+        messages: list[Message] | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        """Persist ReAct conversation state; never let storage failure break a run.
+
+        Plan/team modes checkpoint from inside their own runner, so this is only
+        active when ``self.run_id`` belongs to a react run.
+        """
+        if not self.run_id:
+            return
+        history = messages if messages is not None else self.history
+        record = CheckpointRecord(
+            run_id=self.run_id,
+            mode="react",
+            message=self._run_message,
+            cwd=self.cwd,
+            status=status,
+            state={"messages": _messages_to_dicts(history)},
+            usage=(usage if usage is not None else self.last_usage).to_dict(),
+            turns=0,
+            error=error,
+            progress={"turns": len(history)},
+        )
+        with suppress(Exception):
+            self.checkpoint_store.save(record)
+
+    async def resume(self, record: CheckpointRecord) -> AsyncIterator[dict[str, Any]]:
+        """Restore a ReAct conversation from a checkpoint and continue it."""
+        messages = _messages_from_dicts(record.state.get("messages") or [])
+        if not messages:
+            yield {"type": "error", "error": ValueError("checkpoint 不包含会话历史")}
+            return
+        messages = _strip_dangling_tool_calls(messages)
+        self.history = messages
+        self.last_usage = Usage.from_mapping(record.usage or {})
+        self.run_id = record.run_id
+        self._run_message = record.message
+        # Re-running the original request automatically would re-spend tokens on
+        # work the user may not want repeated; restoring context is enough.
+        yield {
+            "type": "text_delta",
+            "text": (
+                f"已从检查点恢复 {len(messages)} 条会话历史：{record.run_id}\n"
+                f"原始请求：{record.message}\n"
+                "继续输入即可接着对话。\n\n"
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Public API — run the agent
@@ -134,6 +197,10 @@ class Agent:
         snapshot = SnapshotService(self.cwd)
         with suppress(Exception):
             snapshot.create("pre-turn")
+        self._run_message = message
+        # Plan/team runners mint their own run id and checkpoint internally.
+        if self.mode not in {"plan", "team"} and not self.run_id:
+            self.run_id = new_run_id("react")
 
         try:
             if self.mode == "plan":
@@ -145,6 +212,10 @@ class Agent:
             else:
                 async for event in self._run_react(message):
                     yield event
+        except Exception:
+            with suppress(Exception):
+                self._save_checkpoint("interrupted")
+            raise
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
@@ -295,6 +366,8 @@ class Agent:
                 assistant_msg.content = ""
             messages.append(assistant_msg)
             yield {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason}
+            # Land progress each turn so an interruption keeps the conversation.
+            self._save_checkpoint("running", messages=messages, usage=total_usage)
 
             # If the model didn't request any tools, we're done.
             if stop_reason != "tool_use" and not tool_calls:
@@ -348,6 +421,7 @@ class Agent:
         # Persist history for next user message and report final usage.
         self.history = list(messages)
         self.last_usage = total_usage
+        self._save_checkpoint("completed", messages=messages, usage=total_usage)
 
         done_event: dict[str, Any] = {
             "type": "done",
@@ -467,6 +541,65 @@ def _tool_name_by_id(calls: list[dict[str, Any]], tool_call_id: str) -> str:
         if call.get("id") == tool_call_id:
             return str(call.get("function", {}).get("name") or "unknown")
     return "unknown"
+
+
+def _messages_to_dicts(messages: list[Message]) -> list[dict[str, Any]]:
+    """Serialize conversation history for checkpointing."""
+    return [
+        {
+            "role": message.role,
+            "content": message.content,
+            "name": message.name,
+            "tool_call_id": message.tool_call_id,
+            "tool_calls": message.tool_calls,
+        }
+        for message in messages
+    ]
+
+
+def _messages_from_dicts(items: list[dict[str, Any]]) -> list[Message]:
+    """Rebuild conversation history from a checkpoint."""
+    messages: list[Message] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        messages.append(
+            Message(
+                role=item.get("role", "user"),
+                content=item.get("content", ""),
+                name=item.get("name"),
+                tool_call_id=item.get("tool_call_id"),
+                tool_calls=list(item.get("tool_calls") or []),
+            )
+        )
+    return messages
+
+
+def _strip_dangling_tool_calls(messages: list[Message]) -> list[Message]:
+    """Remove trailing assistant messages whose tool_calls have no matching tool
+    result in the checkpoint (e.g. the run was interrupted mid-execution).
+
+    OpenAI-compatible APIs require every assistant message with tool_calls to
+    be followed by corresponding tool-role messages before the next user turn.
+    """
+    if not messages:
+        return messages
+    # Walk from the end; strip any assistant with tool_calls that lacks
+    # a subsequent tool-role reply.
+    pending_tool_ids: set[str] = set()
+    for msg in reversed(messages):
+        if msg.role == "tool" and msg.tool_call_id:
+            pending_tool_ids.add(msg.tool_call_id)
+        elif msg.role == "assistant" and msg.tool_calls:
+            call_ids = {c.get("id", "") for c in msg.tool_calls if isinstance(c, dict)}
+            if not call_ids.issubset(pending_tool_ids):
+                # This assistant has tool_calls not answered by any tool message.
+                # Strip it and everything after it (they are already accounted
+                # for in pending_tool_ids but belong to this orphan chain).
+                idx = messages.index(msg)
+                return messages[:idx]
+            pending_tool_ids -= call_ids
+    return messages
 
 
 def _prepend_skill_candidates(user_message: str, cwd: str, config: VeyloConfig) -> str:
