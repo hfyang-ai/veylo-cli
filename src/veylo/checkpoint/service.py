@@ -16,10 +16,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from veylo.config import VeyloConfig
 
 # Statuses that mean "this run is worth resuming".
 RESUMABLE_STATUSES = ("running", "interrupted")
@@ -92,8 +94,8 @@ class CheckpointStore:
     def __init__(self, project_root: str | Path, root: Path | None = None) -> None:
         self.project_root = Path(project_root).resolve()
         digest = hashlib.sha256(str(self.project_root).encode("utf-8")).hexdigest()[:16]
-        self.root = Path(root) if root is not None else (
-            Path.home() / ".veylo" / "checkpoints" / digest
+        self.root = (
+            Path(root) if root is not None else (Path.home() / ".veylo" / "checkpoints" / digest)
         )
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -159,3 +161,76 @@ class CheckpointStore:
             path.unlink()
             removed += 1
         return removed
+
+    def prune(
+        self,
+        *,
+        max_completed: int = 2,
+        max_resumable: int = 10,
+        ttl: timedelta | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Drop checkpoints that are no longer worth keeping.
+
+        Finished runs are capped at ``max_completed`` and unfinished runs
+        (``running``/``interrupted``) at ``max_resumable``, always dropping the
+        oldest first. When ``ttl`` is given, any unfinished run whose
+        ``updated_at`` is older than ``ttl`` is also removed — this reaps
+        ``running`` records left behind by a crashed process that never got to
+        mark itself finished.
+
+        ``now`` is injectable for tests; defaults to the current UTC time.
+        Returns the number of records removed.
+        """
+        now = now or datetime.now(UTC)
+        records = self.list(limit=10_000)
+        completed = [record for record in records if record.status == "completed"]
+        unfinished = [record for record in records if record.status in RESUMABLE_STATUSES]
+
+        doomed: set[str] = set()
+        doomed.update(record.run_id for record in completed[max_completed:])
+
+        survivors: list[CheckpointRecord] = []
+        for record in unfinished:
+            if ttl is not None and _is_expired(record, ttl, now):
+                doomed.add(record.run_id)
+                continue
+            survivors.append(record)
+        doomed.update(record.run_id for record in survivors[max_resumable:])
+
+        removed = 0
+        for run_id in doomed:
+            if self.delete(run_id):
+                removed += 1
+        return removed
+
+    def prune_with_config(self, config: VeyloConfig, *, now: datetime | None = None) -> int:
+        """Prune using the retention policy from ``config.checkpoint``.
+
+        Convenience wrapper so callers can drive cleanup from the same
+        ``~/.veylo/config.json`` that configures the rest of Veylo.
+        """
+        policy = config.checkpoint
+        return self.prune(
+            max_completed=policy.max_completed,
+            max_resumable=policy.max_resumable,
+            ttl=policy.ttl,
+            now=now,
+        )
+
+
+def _is_expired(record: CheckpointRecord, ttl: timedelta, now: datetime) -> bool:
+    """True if ``record.updated_at`` is older than ``ttl`` relative to ``now``.
+
+    Unparseable timestamps are kept (conservative: never drop something we
+    cannot safely age out).
+    """
+    try:
+        updated = datetime.fromisoformat(record.updated_at)
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now - updated > ttl

@@ -142,6 +142,9 @@ class Agent:
         )
         with suppress(Exception):
             self.checkpoint_store.save(record)
+            # A run just finished; opportunistically prune old checkpoints.
+            if status == "completed":
+                self.checkpoint_store.prune_with_config(self.config)
 
     async def resume(self, record: CheckpointRecord) -> AsyncIterator[dict[str, Any]]:
         """Restore a ReAct conversation from a checkpoint and continue it."""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -101,6 +102,10 @@ class PermissionModeController:
 
 
 async def start_repl(cwd: str, config: VeyloConfig) -> None:
+    # Startup housekeeping: reap stale checkpoints left by a previous crash.
+    # Best-effort — a cleanup failure must never block the REPL from starting.
+    with suppress(Exception):
+        CheckpointStore(cwd).prune_with_config(config)
     console = Console()
     permission_mode = PermissionModeController(config)
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)

@@ -88,6 +88,9 @@ class PlanExecuteAgent:
         )
         with suppress(Exception):
             self.checkpoint_store.save(record)
+            # A run just finished; opportunistically prune old checkpoints.
+            if status == "completed":
+                self.checkpoint_store.prune_with_config(self.config)
 
     async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
         snapshot = SnapshotService(self.cwd)

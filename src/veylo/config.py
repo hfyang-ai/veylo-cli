@@ -5,6 +5,7 @@ import os
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,25 @@ class FeatureConfig:
 
 
 @dataclass(slots=True)
+class CheckpointConfig:
+    """Retention policy for pruning execution checkpoints.
+
+    ``max_completed`` and ``max_resumable`` cap how many finished / unfinished
+    runs are kept (oldest dropped first). ``ttl_seconds`` optionally adds a
+    time-based cleanup for unfinished runs; ``None`` disables it.
+    """
+
+    max_completed: int = 10
+    max_resumable: int = 10
+    ttl_seconds: int = 7 * 24 * 60 * 60  # 7 days
+
+    @property
+    def ttl(self) -> timedelta:
+        """The TTL as a ``timedelta``, or ``None`` when time cleanup is off."""
+        return timedelta(seconds=self.ttl_seconds)
+
+
+@dataclass(slots=True)
 class VeyloConfig:
     llm: LlmConfig = field(default_factory=LlmConfig)
     render_mode: str = "inline"
@@ -110,6 +130,7 @@ class VeyloConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
 
 def load_config(
@@ -288,6 +309,7 @@ def _dict_to_config(data: dict[str, Any]) -> VeyloConfig:
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),
+        checkpoint=CheckpointConfig(**data.get("checkpoint", {})),
     )
 
 

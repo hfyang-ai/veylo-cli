@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
 from veylo.config import load_config
 
@@ -40,3 +41,33 @@ def test_provider_specific_api_key(tmp_path, monkeypatch):
     config = load_config(project_root=tmp_path)
 
     assert config.llm.api_key == "deepseek-key"
+
+
+def test_checkpoint_config_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.checkpoint.max_completed == 2
+    assert config.checkpoint.max_resumable == 10
+    assert config.checkpoint.ttl_seconds is None
+    assert config.checkpoint.ttl is None
+
+
+def test_checkpoint_config_from_file(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".veylo").mkdir(parents=True)
+    (home / ".veylo" / "config.json").write_text(
+        json.dumps(
+            {"checkpoint": {"max_completed": 5, "max_resumable": 20, "ttl_seconds": 604800}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    config = load_config(project_root=tmp_path)
+
+    assert config.checkpoint.max_completed == 5
+    assert config.checkpoint.max_resumable == 20
+    assert config.checkpoint.ttl_seconds == 604800
+    assert config.checkpoint.ttl == timedelta(seconds=604800)
