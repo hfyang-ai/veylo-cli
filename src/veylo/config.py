@@ -106,8 +106,11 @@ class CheckpointConfig:
     """Retention policy for pruning execution checkpoints.
 
     ``max_completed`` and ``max_resumable`` cap how many finished / unfinished
-    runs are kept (oldest dropped first). ``ttl_seconds`` optionally adds a
-    time-based cleanup for unfinished runs; ``None`` disables it.
+    runs are kept (oldest dropped first). ``ttl_seconds`` adds a time-based
+    cleanup that only applies to *unfinished* runs: any ``running`` /
+    ``interrupted`` record whose ``updated_at`` is older than this is dropped,
+    which reaps records left behind by a process that crashed before it could
+    write ``completed``. Set it very large to effectively disable the cleanup.
     """
 
     max_completed: int = 10
@@ -116,7 +119,7 @@ class CheckpointConfig:
 
     @property
     def ttl(self) -> timedelta:
-        """The TTL as a ``timedelta``, or ``None`` when time cleanup is off."""
+        """The unfinished-run retention TTL as a ``timedelta``."""
         return timedelta(seconds=self.ttl_seconds)
 
 

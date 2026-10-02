@@ -48,10 +48,10 @@ def test_checkpoint_config_defaults(tmp_path, monkeypatch):
 
     config = load_config(project_root=tmp_path)
 
-    assert config.checkpoint.max_completed == 2
+    assert config.checkpoint.max_completed == 10
     assert config.checkpoint.max_resumable == 10
-    assert config.checkpoint.ttl_seconds is None
-    assert config.checkpoint.ttl is None
+    assert config.checkpoint.ttl_seconds == 604800  # 7 days
+    assert config.checkpoint.ttl == timedelta(seconds=604800)
 
 
 def test_checkpoint_config_from_file(tmp_path, monkeypatch):
