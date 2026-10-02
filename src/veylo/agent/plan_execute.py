@@ -6,7 +6,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
-from veylo.agent.query import query
+from veylo.agent.loop import run_agent_loop
 from veylo.checkpoint import CheckpointRecord, CheckpointStore, new_run_id
 from veylo.config import VeyloConfig
 from veylo.llm.base import LlmClient
@@ -328,7 +328,7 @@ class PlanExecuteAgent:
         usage = Usage()
         turns = 0
         try:
-            async for event in query(
+            async for event in run_agent_loop(
                 llm_client=self.llm_client,
                 tool_registry=self.tool_registry,
                 system_prompt=self._task_system_prompt(plan, task),

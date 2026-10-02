@@ -16,7 +16,7 @@ from veylo.tools.registry import ToolRegistry
 from veylo.types import Message, Usage
 
 
-async def query(
+async def run_agent_loop(
     *,
     llm_client: LlmClient,
     tool_registry: ToolRegistry,
@@ -29,6 +29,13 @@ async def query(
     skill_context_buffer=None,
     max_turns: int = 20,
 ) -> AsyncIterator[dict[str, Any]]:
+    """Run one complete ReAct agent loop and stream its events.
+
+    Shared kernel behind react-mode turns and the per-task / per-step sub-agents
+    driven by the plan and team runners: repeatedly calls the LLM, executes any
+    requested tools, feeds the results back, and stops once the model stops asking
+    for tools or ``max_turns`` is reached.
+    """
     original_user_message = user_message
     user_message = _prepend_skill_candidates(user_message, cwd, config)
     user_message = _prepend_skill_context(user_message, skill_context_buffer)
